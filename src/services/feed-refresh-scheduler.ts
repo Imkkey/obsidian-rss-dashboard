@@ -18,11 +18,11 @@ export interface FeedRefreshSchedulerOptions {
   requestDueFeeds: (feeds: Feed[]) => Promise<void>;
 }
 
-/** Owns one rearmable timer for automatic, per-feed refresh scheduling. */
+/** Owns one rearmable timer for automatic global and per-feed refreshes. */
 export class FeedRefreshScheduler {
   private timeoutId: number | null = null;
   private started = false;
-  // Single-feed refreshes do not acquire the batch lock.
+  // An automatic global or per-feed callback is still running, including its save.
   private refreshPending = false;
   private globalRefreshDeferredUntil: number | null = null;
 
@@ -36,6 +36,8 @@ export class FeedRefreshScheduler {
   public stop(): void {
     this.started = false;
     this.clearTimer();
+    // Keep ownership across stop/start until the callback settles. The runner
+    // times out feed network waits even when the underlying request cannot abort.
   }
 
   /** Delays the next automatic global attempt after the user cancels one. */
@@ -51,6 +53,8 @@ export class FeedRefreshScheduler {
 
   public reschedule(): void {
     this.clearTimer();
+    // Manual refreshes still run independently; their saves share this automatic
+    // timer, whose next wake is recomputed when the pending callback settles.
     if (!this.started || this.refreshPending) {
       return;
     }

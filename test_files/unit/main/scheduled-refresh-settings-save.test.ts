@@ -6,6 +6,7 @@ import * as feedFetch from "../../../src/services/feed-parser/feed-fetch";
 import type { FeedRefreshScheduler } from "../../../src/services/feed-refresh-scheduler";
 import { FEED_REQUEST_TIMEOUT_MS } from "../../../src/services/feed-timeout";
 import { DEFAULT_SETTINGS, type Feed } from "../../../src/types/types";
+import { createRefreshFeed } from "../fixtures/refresh-feed";
 
 const FEED_XML = `<?xml version="1.0"?>
 <rss version="2.0"><channel><title>Example feed</title>
@@ -25,7 +26,7 @@ function createPendingResponse() {
   return { promise, resolve, reject };
 }
 
-function createPlugin() {
+function createPlugin(feeds: Feed[] = [createRefreshFeed()]) {
   const plugin = new RssDashboardPlugin(
     new App() as unknown as ConstructorParameters<typeof RssDashboardPlugin>[0],
     {
@@ -37,18 +38,9 @@ function createPlugin() {
       minAppVersion: "1.7.2",
     },
   );
-  const feed: Feed = {
-    title: "Example feed",
-    url: "https://example.com/feed.xml",
-    folder: "RSS",
-    items: [],
-    lastUpdated: 0,
-    scanInterval: 5,
-    lastRefreshAttemptCompletedAt: 0,
-  };
   plugin.settings = {
     ...structuredClone(DEFAULT_SETTINGS),
-    feeds: [feed],
+    feeds,
     refreshInterval: 0,
     storageMode: "legacy-json",
     metadataStorageMode: "plugin-default",
@@ -92,6 +84,20 @@ describe("settings saves during an automatic single-feed refresh", () => {
     vi.restoreAllMocks();
     document.body.empty();
   });
+
+  async function startPendingRefresh(feeds?: Feed[]) {
+    const pending = createPendingResponse();
+    const fetchXml = vi
+      .spyOn(feedFetch, "fetchFeedXml")
+      .mockReturnValueOnce(pending.promise)
+      .mockResolvedValue(FEED_XML);
+    const harness = createPlugin(feeds);
+    scheduler = harness.scheduler;
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchXml).toHaveBeenCalledTimes(1);
+    return { ...harness, pending, fetchXml };
+  }
 
   it.each(["success", "network failure", "timeout"] as const)(
     "keeps ten actual settings saves to one request and resumes after %s",
@@ -181,6 +187,154 @@ describe("settings saves during an automatic single-feed refresh", () => {
     pending.resolve(FEED_XML);
     await vi.advanceTimersByTimeAsync(0);
     expect(vi.getTimerCount()).toBe(1);
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it("uses an interval changed through saveSettings after the pending refresh settles", async () => {
+    const { plugin, pending, fetchXml, saveData } = await startPendingRefresh();
+    plugin.settings.feeds[0].scanInterval = 2;
+    await plugin.saveSettings();
+    expect(saveData).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        feeds: [expect.objectContaining({ scanInterval: 2 })],
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(fetchXml).toHaveBeenCalledTimes(1);
+
+    pending.resolve(FEED_XML);
+    await vi.advanceTimersByTimeAsync(0);
+    const completedAt = Date.now();
+    expect(plugin.settings.feeds[0].lastRefreshAttemptCompletedAt).toBe(
+      completedAt,
+    );
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(120_000 - 1);
+    expect(fetchXml).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchXml).toHaveBeenCalledTimes(2);
+    expect(plugin.settings.feeds[0].lastRefreshAttemptCompletedAt).toBe(
+      completedAt + 120_000,
+    );
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it("does not restore or rearm a feed removed through saveSettings while pending", async () => {
+    const { plugin, pending, fetchXml, saveData } = await startPendingRefresh();
+    plugin.settings.feeds = [];
+    await plugin.saveSettings();
+    expect(saveData).toHaveBeenLastCalledWith(
+      expect.objectContaining({ feeds: [] }),
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(fetchXml).toHaveBeenCalledTimes(1);
+
+    pending.resolve(FEED_XML);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(plugin.settings.feeds).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS);
+    expect(fetchXml).toHaveBeenCalledTimes(1);
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it("refreshes the due replacement saved while the previous feed is pending", async () => {
+    const { plugin, pending, fetchXml, saveData } = await startPendingRefresh();
+    const replacement = createRefreshFeed({
+      url: "https://example.com/replacement.xml",
+    });
+    plugin.settings.feeds = [replacement];
+    await plugin.saveSettings();
+    expect(saveData).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        feeds: [expect.objectContaining({ url: replacement.url })],
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(fetchXml).toHaveBeenCalledTimes(1);
+
+    pending.resolve(FEED_XML);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchXml.mock.calls.map(([url]) => url)).toEqual([
+      "https://example.com/feed.xml",
+      replacement.url,
+    ]);
+    expect(plugin.settings.feeds).toHaveLength(1);
+    expect(plugin.settings.feeds[0].url).toBe(replacement.url);
+    expect(
+      plugin.settings.feeds[0].lastRefreshAttemptCompletedAt,
+    ).toBeGreaterThan(0);
+    expect(vi.getTimerCount()).toBe(1);
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it("resumes after stop/start when a non-abortable network request times out", async () => {
+    const {
+      plugin,
+      fetchXml,
+      scheduler: activeScheduler,
+    } = await startPendingRefresh();
+    // Leave the network promise unresolved even after its abort signal fires.
+    const signal = fetchXml.mock.calls[0][2];
+    activeScheduler.stop();
+    activeScheduler.start();
+    await plugin.saveSettings();
+    await vi.advanceTimersByTimeAsync(FEED_REQUEST_TIMEOUT_MS - 1);
+    expect(fetchXml).toHaveBeenCalledTimes(1);
+    expect(signal?.aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(signal?.aborted).toBe(true);
+    expect(plugin.settings.feeds[0].lastFetchError).toContain("Timed out");
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(INTERVAL_MS - 1);
+    expect(fetchXml).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchXml).toHaveBeenCalledTimes(2);
+    expect(console.error).not.toHaveBeenCalledWith(
+      "[RSS Dashboard] Backup after save failed:",
+      expect.anything(),
+    );
+  });
+
+  it("refreshes an unrelated feed manually and rearms from its current completion time", async () => {
+    const automatic = createRefreshFeed();
+    const manual = createRefreshFeed({
+      url: "https://example.com/manual.xml",
+      scanInterval: 1,
+      lastRefreshAttemptCompletedAt: Date.now(),
+    });
+    const { plugin, pending, fetchXml } = await startPendingRefresh([
+      automatic,
+      manual,
+    ]);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await plugin.refreshSelectedFeed(manual);
+    const manualCompletedAt = Date.now();
+    expect(fetchXml.mock.calls.map(([url]) => url)).toEqual([
+      automatic.url,
+      manual.url,
+    ]);
+    expect(plugin.settings.feeds[1].lastRefreshAttemptCompletedAt).toBe(
+      manualCompletedAt,
+    );
+    await plugin.saveSettings();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fetchXml).toHaveBeenCalledTimes(2);
+
+    pending.resolve(FEED_XML);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(50_000 - 1);
+    expect(fetchXml).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchXml.mock.calls.map(([url]) => url)).toEqual([
+      automatic.url,
+      manual.url,
+      manual.url,
+    ]);
+    expect(plugin.settings.feeds[1].lastRefreshAttemptCompletedAt).toBe(
+      manualCompletedAt + 60_000,
+    );
     expect(console.error).not.toHaveBeenCalled();
   });
 });

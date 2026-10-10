@@ -1,19 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FeedRefreshScheduler } from "../../../src/services/feed-refresh-scheduler";
 import type { Feed } from "../../../src/types/types";
-
-function createFeed(overrides: Partial<Feed> = {}): Feed {
-  return {
-    title: "Example feed",
-    url: "https://example.com/feed.xml",
-    folder: "RSS",
-    items: [],
-    lastUpdated: 0,
-    scanInterval: 5,
-    lastRefreshAttemptCompletedAt: 0,
-    ...overrides,
-  };
-}
+import { createRefreshFeed } from "../fixtures/refresh-feed";
 
 function createPendingRefresh() {
   let resolve!: () => void;
@@ -24,7 +12,7 @@ function createPendingRefresh() {
 }
 
 function createHarness() {
-  const feed = createFeed();
+  const feed = createRefreshFeed();
   const state = {
     feeds: [feed],
     globalInterval: 0,
@@ -124,7 +112,7 @@ describe("FeedRefreshScheduler with a pending automatic refresh", () => {
 
   it("refreshes a due replacement from the current feed list after settlement", async () => {
     const harness = await startPendingRefresh();
-    const replacement = createFeed({
+    const replacement = createRefreshFeed({
       url: "https://example.com/replacement.xml",
     });
     harness.state.feeds = [replacement];
@@ -141,7 +129,7 @@ describe("FeedRefreshScheduler with a pending automatic refresh", () => {
 
   it("does not drop another feed that becomes due while waiting", async () => {
     const harness = await startPendingRefresh();
-    const later = createFeed({
+    const later = createRefreshFeed({
       url: "https://example.com/later.xml",
       lastRefreshAttemptCompletedAt: Date.now() - 299_000,
     });
