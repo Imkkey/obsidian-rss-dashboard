@@ -11,6 +11,14 @@ import {
   type RssDashboardSettings,
 } from "../../../src/types/types";
 
+import {
+  BUNDLE_KINDS,
+  type BundleKind,
+  buildBundle,
+  importBundle,
+  failNextStateWrite,
+} from "./bundle-import-fixture";
+
 const DAY = 24 * 60 * 60 * 1000;
 const BASE_TIME = Date.parse("2026-01-01T00:00:00Z");
 const STATE_KEY = "feed-1:guid-restored";
@@ -45,7 +53,10 @@ function makeItem(guid: string, pubDate: string): FeedItem {
   };
 }
 
-async function prepareRestore(kind: "feed" | "portable") {
+async function prepareRestore(
+  kind: BundleKind,
+  restoredState: ArticleUserState = RESTORED_STATE,
+) {
   const clock = vi.spyOn(Date, "now").mockReturnValue(BASE_TIME);
   const app = App.createMock();
   let repository = new FeedStorageRepository(app);
@@ -80,6 +91,10 @@ async function prepareRestore(kind: "feed" | "portable") {
     return Promise.resolve();
   };
   const save = () => repository.persistSettings(settings, saveData);
+  const saveAuthoritatively = () =>
+    repository.persistSettings(settings, saveData, {
+      authoritativeArticleState: true,
+    });
   const reload = async (freshRepository = true) => {
     const metadata = JSON.parse(metadataJson) as PersistedRssDashboardSettings;
     settings = {
@@ -91,6 +106,13 @@ async function prepareRestore(kind: "feed" | "portable") {
   };
   const state = () => repository.loadUserState(settings);
   const atDay = (day: number) => clock.mockReturnValue(BASE_TIME + day * DAY);
+  const markRestoredRead = () => {
+    const restored = settings.feeds[0].items.find(
+      (item) => item.guid === "guid-restored",
+    );
+    if (!restored) throw new Error("Expected restored fixture article");
+    restored.read = true;
+  };
   const addParserItem = () => {
     settings.feeds[0].items.push(makeItem("guid-restored", "2020-01-01"));
   };
@@ -103,11 +125,11 @@ async function prepareRestore(kind: "feed" | "portable") {
   exported.feeds[0].items = exported.feeds[0].items.filter(
     (item) => item.guid !== "guid-omitted",
   );
-  const bundle = clone(
-    kind === "feed"
-      ? repository.buildFeedBundle(exported)
-      : repository.buildPortableDataBundle(exported),
-  );
+  exported.feeds[0].items[0] = {
+    ...makeItem("guid-restored", "2020-01-01"),
+    ...clone(restoredState),
+  };
+  const bundle = buildBundle(repository, kind, exported);
   const prune = () => {
     settings.feeds = settings.feeds.map((feed) =>
       applyFeedRetentionLimits(feed, {
@@ -132,13 +154,8 @@ async function prepareRestore(kind: "feed" | "portable") {
     BASE_TIME,
   );
 
-  const restore = async () => {
-    if (kind === "feed") {
-      await repository.importFeedBundle(bundle, settings, saveData);
-    } else {
-      await repository.importPortableDataBundle(bundle, settings, saveData);
-    }
-  };
+  const restore = () =>
+    importBundle(repository, kind, bundle, settings, saveData);
   const expectRestored = async () => {
     // Reload immediately after the tested save. A second save of the live
     // imported flags could repair the deleted state and mask this regression.
@@ -155,12 +172,14 @@ async function prepareRestore(kind: "feed" | "portable") {
     app,
     atDay,
     save,
+    saveAuthoritatively,
     reload,
     state,
     prune,
     restore,
     expectRestored,
     addParserItem,
+    markRestoredRead,
   };
 }
 
@@ -169,9 +188,84 @@ afterEach(() => {
   document.body.empty();
 });
 
-describe.each(["feed", "portable"] as const)(
-  "%s bundle restored-state GC",
+describe.each(BUNDLE_KINDS)(
+  "%s bundle restored article state garbage collection (issue #963)",
   (kind) => {
+    it("clears prior absence evidence for a restored article with no signal or state baseline", async () => {
+      const fixture = await prepareRestore(kind, {
+        read: false,
+        starred: false,
+        saved: false,
+      });
+      const persisted = await fixture.state();
+      if (!persisted) throw new Error("Expected persisted state fixture");
+      delete persisted.states[STATE_KEY];
+      await fixture.app.vault.adapter.write(
+        USER_STATE_PATH,
+        JSON.stringify(persisted),
+      );
+      fixture.atDay(91);
+      await fixture.restore();
+      expect((await fixture.state())?.states[STATE_KEY]).toBeUndefined();
+      expect(
+        (await fixture.state())?.missingSinceByStateKey?.[STATE_KEY],
+      ).toBeUndefined();
+      await fixture.reload();
+      expect((await fixture.state())?.states[STATE_KEY]).toBeUndefined();
+    });
+
+    it("keeps stateless restoration evidence when no user-state file needs writing", async () => {
+      const fixture = await prepareRestore(kind, {
+        read: false,
+        starred: false,
+        saved: false,
+      });
+      await fixture.app.vault.adapter.remove(USER_STATE_PATH);
+      fixture.atDay(89);
+      await fixture.restore();
+      expect(await fixture.app.vault.adapter.exists(USER_STATE_PATH)).toBe(
+        false,
+      );
+      fixture.markRestoredRead();
+      fixture.atDay(91);
+      await fixture.save();
+      expect(
+        (await fixture.state())?.missingSinceByStateKey?.[STATE_KEY],
+      ).toBeUndefined();
+      fixture.atDay(181);
+      await fixture.save();
+      await fixture.reload();
+      expect((await fixture.state())?.states[STATE_KEY]?.read).toBe(true);
+    });
+
+    it("retains a prior confirmed restoration across a later failed import and rollback", async () => {
+      const fixture = await prepareRestore(kind);
+      fixture.atDay(89);
+      await fixture.restore();
+      failNextStateWrite(fixture.app, USER_STATE_PATH);
+      await expect(fixture.restore()).rejects.toThrow("state write failed");
+      fixture.atDay(181);
+      await fixture.save();
+      await fixture.expectRestored();
+    });
+
+    it("does not exempt backup articles when a failed import rolls back", async () => {
+      const fixture = await prepareRestore(kind);
+      // The backup includes an item that arrived since hydration, but this is
+      // parser output, not a confirmed restoration of the missing article.
+      fixture.addParserItem();
+      failNextStateWrite(fixture.app, USER_STATE_PATH);
+      fixture.atDay(89);
+      await expect(fixture.restore()).rejects.toThrow("state write failed");
+      expect((await fixture.state())?.missingSinceByStateKey?.[STATE_KEY]).toBe(
+        BASE_TIME,
+      );
+      fixture.atDay(91);
+      await fixture.save();
+      await fixture.reload();
+      expect((await fixture.state())?.states[STATE_KEY]).toBeUndefined();
+    });
+
     it("preserves restored state on the first import after the old timer expires", async () => {
       const fixture = await prepareRestore(kind);
       fixture.atDay(91);
@@ -291,19 +385,7 @@ describe.each(["feed", "portable"] as const)(
     });
     it("does not invalidate absence evidence when the import state write fails and rolls back", async () => {
       const fixture = await prepareRestore(kind);
-      const write = fixture.app.vault.adapter.write.bind(
-        fixture.app.vault.adapter,
-      );
-      let failed = false;
-      vi.spyOn(fixture.app.vault.adapter, "write").mockImplementation(
-        async (path, data) => {
-          if (path === USER_STATE_PATH && !failed) {
-            failed = true;
-            throw new Error("state write failed");
-          }
-          await write(path, data);
-        },
-      );
+      failNextStateWrite(fixture.app, USER_STATE_PATH);
       fixture.atDay(89);
       await expect(fixture.restore()).rejects.toThrow("state write failed");
       expect((await fixture.state())?.missingSinceByStateKey?.[STATE_KEY]).toBe(
@@ -327,5 +409,19 @@ it("does not let ordinary parser items invalidate the prior absence evidence", a
   );
   fixture.atDay(91);
   await fixture.save();
+  expect((await fixture.state())?.states[STATE_KEY]).toBeUndefined();
+});
+
+it("does not treat authoritative state alone as a confirmed article restoration", async () => {
+  const fixture = await prepareRestore("feed");
+  fixture.atDay(89);
+  fixture.addParserItem();
+  await fixture.saveAuthoritatively();
+  expect((await fixture.state())?.missingSinceByStateKey?.[STATE_KEY]).toBe(
+    BASE_TIME,
+  );
+  fixture.atDay(91);
+  await fixture.save();
+  await fixture.reload();
   expect((await fixture.state())?.states[STATE_KEY]).toBeUndefined();
 });
